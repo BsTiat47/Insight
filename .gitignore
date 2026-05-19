@@ -19,6 +19,10 @@ build/
 dist/
 *.spec
 
+# Local SSH keys (never commit)
+ssh_key
+ssh_key.pub
+
 # IDE / OS
 .idea/
 .vscode/
