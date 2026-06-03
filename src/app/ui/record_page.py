@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from typing import Callable
 
-from PySide6.QtCore import QDateTime, Qt, QTime
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QDateTime, Qt, QTime, QTimer
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDateTimeEdit,
     QDialog,
@@ -454,16 +455,30 @@ class RecordPage(QWidget):
         self.next_week_btn.clicked.connect(self.show_next_week)
         self.today_week_btn.clicked.connect(self.show_current_week)
 
+        self.ai_toggle = QCheckBox("AI 自动补全")
+        self.ai_toggle.setChecked(self._load_ai_enabled())
+        self.ai_toggle.toggled.connect(self._on_ai_toggled)
+
         week_controls = QHBoxLayout()
         week_controls.addWidget(self.prev_week_btn)
         week_controls.addWidget(self.next_week_btn)
         week_controls.addWidget(self.today_week_btn)
         week_controls.addWidget(self.week_title)
         week_controls.addStretch()
+        week_controls.addWidget(self.ai_toggle)
 
         self.week_timeline = WeekTimelineWidget(slot_minutes=5)
         self.week_timeline.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.week_timeline.customContextMenuRequested.connect(self.open_timeline_menu)
+        self.week_timeline.recordMoved.connect(self._on_records_moved)
+        self.week_timeline.selectionChanged.connect(self._on_selection_for_ai)
+
+        self._ai_suggestion: list[dict] | None = None  # list of {block_name, start_dt, end_dt, ...}
+
+        self._tab_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Tab), self)
+        self._tab_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._tab_shortcut.activated.connect(self._on_tab_accept_ai)
+
         self.sleep_buttons: list[QPushButton] = []
         sleep_row = QHBoxLayout()
         sleep_row.setSpacing(6)
@@ -505,10 +520,130 @@ class RecordPage(QWidget):
         self._week_start = self._get_week_start(date.today())
         self.refresh()
 
+    # ── AI suggestion ──
+
+    @staticmethod
+    def _load_ai_enabled() -> bool:
+        try:
+            with session_scope() as session:
+                from ..storage.repositories import get_ai_settings
+                return get_ai_settings(session).enabled
+        except Exception:
+            return False
+
+    def _on_ai_toggled(self, checked: bool) -> None:
+        try:
+            with session_scope() as session:
+                from ..storage.repositories import get_ai_settings, save_ai_settings
+                s = get_ai_settings(session)
+                save_ai_settings(session, enabled=checked, api_url=s.api_url,
+                                 api_key=s.api_key, model=s.model, system_prompt=s.system_prompt)
+        except Exception:
+            pass
+
+    def _on_selection_for_ai(self, start_dt: datetime, end_dt: datetime) -> None:
+        """Trigger AI suggestion when user finishes a time-range selection."""
+        if not self.ai_toggle.isChecked():
+            return
+        self.week_timeline.show_ai_thinking()
+        self._ai_suggestion = None
+        QTimer.singleShot(300, lambda: self._request_ai_suggestion(start_dt, end_dt))
+
+    def _request_ai_suggestion(self, start_dt: datetime, end_dt: datetime) -> None:
+        """Load DB context, then call API and display result."""
+        from ..services.ai_service import AIContext, build_ai_context, call_ai_api
+
+        ctx: AIContext | None = None
+        try:
+            with session_scope() as session:
+                ctx = build_ai_context(session, start_dt, end_dt)
+        except Exception:
+            pass
+        if ctx is None:
+            self.week_timeline.clear_ai_suggestion()
+            return
+
+        try:
+            result = call_ai_api(ctx, start_dt, end_dt)
+        except Exception:
+            result = None
+
+        if result is not None and hasattr(result, 'events') and result.events:
+            events_data: list[dict] = []
+            for ev in result.events:
+                events_data.append({
+                    "block_name": ev.block_name,
+                    "start_dt": start_dt + timedelta(minutes=ev.start_offset_minutes),
+                    "end_dt": start_dt + timedelta(minutes=ev.end_offset_minutes),
+                    "efficiency_score": ev.efficiency_score,
+                    "state_score": ev.state_score,
+                    "mood_score": ev.mood_score,
+                    "note": ev.note,
+                })
+            self._ai_suggestion = events_data
+            self.week_timeline.show_ai_suggestion(events_data)
+        else:
+            self.week_timeline.clear_ai_suggestion()
+
+    def _on_tab_accept_ai(self) -> None:
+        """Tab key: silently accept AI suggestion if available."""
+        if self._ai_suggestion is not None:
+            self._accept_ai_suggestion()
+
+    def _accept_ai_suggestion(self) -> None:
+        """Create records from the AI suggestion (multi-event batch)."""
+        if self._ai_suggestion is None:
+            QMessageBox.information(self, "提示", "没有AI建议可接受。")
+            return
+        events_data = self._ai_suggestion
+
+        # Resolve block IDs
+        with session_scope() as session:
+            blocks = list_blocks(session, include_inactive=True)
+        block_name_to_id: dict[str, int] = {b.name: b.id for b in blocks}
+
+        missing = [ev["block_name"] for ev in events_data if ev["block_name"] not in block_name_to_id]
+        if missing:
+            QMessageBox.warning(self, "提示", f"未找到方块：{', '.join(missing)}，请先创建。")
+            return
+
+        # Batch create all events with undo support
+        commands: list = []
+        new_ids: list[int] = []
+        with session_scope() as session:
+            for ev in events_data:
+                bid = block_name_to_id[ev["block_name"]]
+                rec = create_record(
+                    session, bid, ev["start_dt"], ev["end_dt"],
+                    ev.get("efficiency_score"), ev.get("state_score"), ev.get("mood_score"),
+                    None, ev.get("note"),
+                )
+                apply_points_for_new_record(session, rec)
+                snap = snapshot_from_record(rec)
+                commands.append(CreateRecordCmd(snap, rec.id))
+                new_ids.append(rec.id)
+        for cmd in commands:
+            if self._undo_stack is not None:
+                self._undo_stack.push(cmd)
+
+        self.week_timeline.clear_ai_suggestion()
+        self.week_timeline.clear_selection()
+        self._ai_suggestion = None
+        self.refresh()
+        self._on_data_changed()
+
     def open_timeline_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
         selected = self.week_timeline.selected_range()
         if selected is None:
-            QMessageBox.information(self, "提示", "请先在时间轴框选一个时间范围。")
+            # Fallback: check if right-clicked on a record, use its time range
+            hit_ids = self.week_timeline._records_at_point(pos)
+            if hit_ids:
+                for rec_data in self.week_timeline._records:
+                    if rec_data.id == hit_ids[0]:
+                        selected = (rec_data.start_time, rec_data.end_time)
+                        break
+        if selected is None:
+            QMessageBox.information(self, "提示", "请先在时间轴框选一个时间范围，或右键点击已有事件。")
             return
         start_dt, end_dt = selected
         with session_scope() as session:
@@ -517,6 +652,11 @@ class RecordPage(QWidget):
         block_map = {b.id: b.name for b in blocks}
 
         menu = QMenu(self)
+        if self._ai_suggestion is not None:
+            names = " → ".join(ev["block_name"] for ev in self._ai_suggestion)
+            ai_action = menu.addAction(f"🤖 接受AI建议：{names}")
+        else:
+            ai_action = None
         new_action = menu.addAction("新建事件")
         delete_all_action = menu.addAction(f"全部删除（框选范围内共 {len(hit_records)} 条）")
         delete_all_action.setEnabled(bool(hit_records))
@@ -535,6 +675,9 @@ class RecordPage(QWidget):
 
         chosen = menu.exec(self.week_timeline.mapToGlobal(pos))
         if chosen is None:
+            return
+        if ai_action is not None and chosen == ai_action:
+            self._accept_ai_suggestion()
             return
         if chosen == new_action:
             self.open_editor(start_dt, end_dt, record_id=None)
@@ -648,6 +791,47 @@ class RecordPage(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.refresh()
             self._on_data_changed()
+
+    def _on_records_moved(self, moves: list) -> None:
+        """Handle recordMoved signal: update DB and push undo commands.
+
+        moves: list of (record_id, new_start_time, new_end_time)
+        """
+        commands: list[UpdateRecordCmd] = []
+        with session_scope() as session:
+            for record_id, new_start, new_end in moves:
+                rec = get_record_by_id(session, record_id)
+                if rec is None:
+                    continue
+                before = snapshot_from_record(rec)
+                after = RecordUndoSnapshot(
+                    block_id=rec.block_id,
+                    start_time=new_start,
+                    end_time=new_end,
+                    efficiency_score=rec.efficiency_score,
+                    state_score=rec.state_score,
+                    mood_score=rec.mood_score,
+                    tags=rec.tags,
+                    note=rec.note,
+                )
+                update_record(
+                    session,
+                    record_id,
+                    block_id=rec.block_id,
+                    start_time=new_start,
+                    end_time=new_end,
+                    efficiency_score=rec.efficiency_score,
+                    state_score=rec.state_score,
+                    mood_score=rec.mood_score,
+                    tags=rec.tags,
+                    note=rec.note,
+                )
+                commands.append(UpdateRecordCmd(record_id, before, after))
+        for cmd in commands:
+            if self._undo_stack is not None:
+                self._undo_stack.push(cmd)
+        self.refresh()
+        self._on_data_changed()
 
     def refresh(self) -> None:
         self._refresh_week_title()

@@ -5,8 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import uuid4
 
+from PySide6.QtCharts import (
+    QBarCategoryAxis,
+    QBarSeries,
+    QBarSet,
+    QChart,
+    QChartView,
+    QLineSeries,
+    QValueAxis,
+)
 from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -24,7 +33,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-import pyqtgraph as pg
 
 from ..services.analytics_service import CategorySeries, build_category_overview, build_custom_metrics
 from ..storage.database import session_scope
@@ -51,7 +59,6 @@ class ViewConfig:
 class StatsPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        pg.setConfigOptions(antialias=True, foreground="#334155", background="w")
 
         self._removed_view_ids: set[str] = set()
         self._custom_views: list[ViewConfig] = []
@@ -76,7 +83,7 @@ class StatsPage(QWidget):
         self.overview_list.verticalScrollBar().setSingleStep(12)
         self.overview_list.model().rowsMoved.connect(lambda *_args: self._sync_order_from_list())  # type: ignore[arg-type]
 
-        self._card_cache: dict[str, tuple[QGroupBox, QLabel, pg.PlotWidget]] = {}
+        self._card_cache: dict[str, tuple[QGroupBox, QLabel, QChartView]] = {}
         self._item_by_view_id: dict[str, QListWidgetItem] = {}
         self._view_order: list[str] = []
         self._handle_map: dict[QWidget, str] = {}
@@ -88,7 +95,6 @@ class StatsPage(QWidget):
         self._category_data_cache: dict[str, CategorySeries] = {}
         self._active_views: dict[str, ViewConfig] = {}
         self._current_days = 7
-        self._right_viewboxes: dict[pg.PlotWidget, pg.ViewBox] = {}
 
         range_row = QHBoxLayout()
         range_row.addStretch()
@@ -146,12 +152,16 @@ class StatsPage(QWidget):
         controls_layout.addWidget(self.render_custom_btn)
         controls_layout.addWidget(self.save_custom_btn)
 
-        self.custom_plot = pg.PlotWidget()
-        self.custom_plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.custom_chart = QChart()
+        self.custom_chart.setBackgroundBrush(QBrush(QColor("#FFFFFF")))
+        self.custom_chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
+        self.custom_chart_view = QChartView(self.custom_chart)
+        self.custom_chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.custom_chart_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         custom_layout = QHBoxLayout(self.custom_tab)
         custom_layout.addWidget(controls_group, stretch=0)
-        custom_layout.addWidget(self.custom_plot, stretch=1)
+        custom_layout.addWidget(self.custom_chart_view, stretch=1)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -187,85 +197,115 @@ class StatsPage(QWidget):
     def _selected_days(self, combo: QComboBox) -> int:
         return int(combo.currentData() or 7)
 
-    def _ensure_secondary_axis(self, plot_widget: pg.PlotWidget) -> pg.ViewBox:
-        if plot_widget in self._right_viewboxes:
-            return self._right_viewboxes[plot_widget]
+    @staticmethod
+    def _compute_max(values: list[float]) -> float:
+        valid = [v for v in values if v]
+        return max(valid) if valid else 0.0
 
-        plot_item = plot_widget.getPlotItem()
-        right_vb = pg.ViewBox()
-        plot_item.showAxis("right")
-        plot_item.scene().addItem(right_vb)
-        plot_item.getAxis("right").linkToView(right_vb)
-        right_vb.setXLink(plot_item.vb)
-
-        def update_views() -> None:
-            right_vb.setGeometry(plot_item.vb.sceneBoundingRect())
-            right_vb.linkedViewChanged(plot_item.vb, right_vb.XAxis)
-
-        plot_item.vb.sigResized.connect(update_views)
-        update_views()
-        self._right_viewboxes[plot_widget] = right_vb
-        return right_vb
-
-    def _plot_series(self, plot_widget: pg.PlotWidget, series: CategorySeries, title: str, bar_color: str, metrics: dict[str, bool]) -> None:
-        plot_item = plot_widget.getPlotItem()
-        right_vb = self._ensure_secondary_axis(plot_widget)
-        right_vb.clear()
-        plot_item.clear()
-        plot_item.setTitle(f"<span style='font-size:10pt'>{title}</span>")
-        plot_item.showGrid(x=True, y=True, alpha=0.2)
-        plot_item.getAxis("left").setTextPen(pg.mkPen("#64748B"))
-        plot_item.getAxis("bottom").setTextPen(pg.mkPen("#64748B"))
-        plot_item.getAxis("right").setTextPen(pg.mkPen("#64748B"))
+    def _plot_series(self, chart_view: QChartView, series: CategorySeries, title: str, bar_color: str, metrics: dict[str, bool]) -> None:
+        chart = chart_view.chart()
+        chart.removeAllSeries()
+        for axis in chart.axes():
+            chart.removeAxis(axis)
 
         x = list(range(len(series.dates)))
-        tick_idx = x[:: max(1, len(x) // 10)] if x else []
-        if tick_idx:
-            plot_item.getAxis("bottom").setTicks([[(i, series.dates[i]) for i in tick_idx]])
-        else:
-            plot_item.getAxis("bottom").setTicks([[]])
+        if not x:
+            chart.setTitle(title)
+            return
+
+        # X axis with sparse labels to avoid overlap
+        axis_x = QBarCategoryAxis()
+        step = max(1, len(x) // 10)
+        tick_set = set(x[::step])
+        labels = [series.dates[i] if i in tick_set else "" for i in x]
+        axis_x.append(labels)
+        axis_x.setLabelsColor(QColor("#64748B"))
+        axis_x.setGridLineVisible(False)
+        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+
+        # Left Y axis
+        axis_left = QValueAxis()
+        axis_left.setLabelsColor(QColor("#64748B"))
+        axis_left.setGridLineVisible(True)
+        axis_left.setGridLineColor(QColor("#E2E8F0"))
+        axis_left.setLabelFormat("%.0f")
+        chart.addAxis(axis_left, Qt.AlignmentFlag.AlignLeft)
+
+        # Right Y axis (conditional)
+        has_right = any(metrics.get(k, True) for k in ["efficiency", "state", "mood"])
+        axis_right = None
+        if has_right:
+            axis_right = QValueAxis()
+            axis_right.setLabelsColor(QColor("#64748B"))
+            axis_right.setGridLineVisible(False)
+            axis_right.setLabelFormat("%.1f")
+            axis_right.setRange(0, 5.0)
+            chart.addAxis(axis_right, Qt.AlignmentFlag.AlignRight)
 
         max_left = 0.0
+
+        # Bar: duration
         if metrics.get("duration", True):
-            base_color = QColor(bar_color)
-            fill_color = QColor(base_color)
-            fill_color.setAlpha(95)
-            bars = pg.BarGraphItem(x=x, height=series.duration_minutes, width=0.6, brush=fill_color, pen=base_color)
-            plot_item.addItem(bars)
+            bar_set = QBarSet("时长")
+            bar_color_q = QColor(bar_color)
+            bar_set.setColor(bar_color_q)
+            bar_set.setBorderColor(bar_color_q)
+            for v in series.duration_minutes:
+                bar_set.append(v)
+            bar_series = QBarSeries()
+            bar_series.append(bar_set)
+            bar_series.setBarWidth(0.6)
+            chart.addSeries(bar_series)
+            bar_series.attachAxis(axis_x)
+            bar_series.attachAxis(axis_left)
             if series.duration_minutes:
                 max_left = max(max_left, max(series.duration_minutes))
+
+        # Line: frequency (left axis)
         if metrics.get("frequency", True):
-            plot_item.plot(
-                x,
-                series.frequency,
-                pen=pg.mkPen("#334155", width=2),
-                symbol="o",
-                symbolSize=4,
-                symbolBrush="#334155",
-            )
+            line = QLineSeries()
+            line.setName("频次")
+            line.setPen(QPen(QColor("#334155"), 2))
+            line.setPointsVisible(True)
+            for i, v in enumerate(series.frequency):
+                line.append(i, float(v))
+            chart.addSeries(line)
+            line.attachAxis(axis_x)
+            line.attachAxis(axis_left)
             if series.frequency:
                 max_left = max(max_left, float(max(series.frequency)))
-        left_top = max(1.0, max_left * 1.15)
-        plot_item.setYRange(0, left_top, padding=0)
 
-        secondary_needed = metrics.get("efficiency", True) or metrics.get("state", True) or metrics.get("mood", True)
-        plot_item.showAxis("right", secondary_needed)
-        if secondary_needed:
-            max_right = 0.0
-            if metrics.get("efficiency", True):
-                right_vb.addItem(pg.PlotCurveItem(x, series.avg_efficiency, pen=pg.mkPen("#DC2626", width=2)))
-                if series.avg_efficiency:
-                    max_right = max(max_right, max(series.avg_efficiency))
-            if metrics.get("state", True):
-                right_vb.addItem(pg.PlotCurveItem(x, series.avg_state, pen=pg.mkPen("#0EA5A4", width=2)))
-                if series.avg_state:
-                    max_right = max(max_right, max(series.avg_state))
-            if metrics.get("mood", True):
-                right_vb.addItem(pg.PlotCurveItem(x, series.avg_mood, pen=pg.mkPen("#8B5CF6", width=2)))
-                if series.avg_mood:
-                    max_right = max(max_right, max(series.avg_mood))
-            right_top = max(1.0, max_right * 1.15)
-            right_vb.setYRange(0, right_top, padding=0)
+        axis_left.setRange(0, max(1.0, max_left * 1.15))
+
+        # Lines: right-axis metrics
+        right_config = [
+            ("efficiency", "效率均值", "#DC2626"),
+            ("state", "状态均值", "#0EA5A4"),
+            ("mood", "心情均值", "#8B5CF6"),
+        ]
+        max_right = 0.0
+        if axis_right:
+            for key, name, color in right_config:
+                if not metrics.get(key, True):
+                    continue
+                vals = getattr(series, f"avg_{key}")
+                line = QLineSeries()
+                line.setName(name)
+                line.setPen(QPen(QColor(color), 2))
+                line.setPointsVisible(True)
+                for i, v in enumerate(vals):
+                    line.append(i, float(v))
+                chart.addSeries(line)
+                line.attachAxis(axis_x)
+                line.attachAxis(axis_right)
+                if vals:
+                    max_right = max(max_right, max(vals))
+            axis_right.setRange(0, max(1.0, max_right * 1.15))
+
+        chart.setTitle(title)
+        chart.legend().setVisible(True)
+        chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
 
     def _base_views(self) -> list[ViewConfig]:
         return [
@@ -287,7 +327,7 @@ class StatsPage(QWidget):
             ),
         ]
 
-    def _ensure_card(self, view_id: str) -> tuple[QGroupBox, QLabel, pg.PlotWidget]:
+    def _ensure_card(self, view_id: str) -> tuple[QGroupBox, QLabel, QChartView]:
         if view_id in self._card_cache:
             return self._card_cache[view_id]
         card = QGroupBox()
@@ -309,12 +349,16 @@ class StatsPage(QWidget):
         title_row.addWidget(del_btn)
         card_layout.addLayout(title_row)
 
-        plot_widget = pg.PlotWidget()
-        plot_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        plot_widget.installEventFilter(self)
-        self._canvas_map[plot_widget] = view_id
-        card_layout.addWidget(plot_widget)
-        self._card_cache[view_id] = (card, title_label, plot_widget)
+        chart = QChart()
+        chart.setBackgroundBrush(QBrush(QColor("#FFFFFF")))
+        chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
+        chart_view = QChartView(chart)
+        chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        chart_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        chart_view.installEventFilter(self)
+        self._canvas_map[chart_view] = view_id
+        card_layout.addWidget(chart_view)
+        self._card_cache[view_id] = (card, title_label, chart_view)
         return self._card_cache[view_id]
 
     def _ensure_item(self, view_id: str) -> QListWidgetItem:
@@ -329,7 +373,7 @@ class StatsPage(QWidget):
         )
         self.overview_list.addItem(item)
         self._item_by_view_id[view_id] = item
-        card, _label, _plot_widget = self._ensure_card(view_id)
+        card, _label, _chart_view = self._ensure_card(view_id)
         self.overview_list.setItemWidget(item, card)
         return item
 
@@ -349,9 +393,8 @@ class StatsPage(QWidget):
             self.overview_list.takeItem(row)
         card_tuple = self._card_cache.pop(view_id, None)
         if card_tuple:
-            plot_widget = card_tuple[2]
-            self._canvas_map.pop(plot_widget, None)
-            self._right_viewboxes.pop(plot_widget, None)
+            chart_view = card_tuple[2]
+            self._canvas_map.pop(chart_view, None)
             card_tuple[0].deleteLater()
         stale_handles = [w for w, vid in self._handle_map.items() if vid == view_id]
         for w in stale_handles:
@@ -405,8 +448,8 @@ class StatsPage(QWidget):
         viewport_h = max(200, self.overview_list.viewport().height())
         target_h = max(280, int(viewport_h * 0.48))
         for view_id, item in self._item_by_view_id.items():
-            card, _label, plot_widget = self._card_cache[view_id]
-            plot_widget.setMinimumHeight(target_h)
+            card, _label, chart_view = self._card_cache[view_id]
+            chart_view.setMinimumHeight(target_h)
             item.setSizeHint(QSize(self.overview_list.viewport().width() - 12, target_h + 72))
             card.setMinimumHeight(target_h + 48)
 
@@ -477,16 +520,16 @@ class StatsPage(QWidget):
 
         vid = self._render_queue.pop(0)
         view = self._active_views[vid]
-        card, title_label, plot_widget = self._card_cache[vid]
+        card, title_label, chart_view = self._card_cache[vid]
         title_label.setText(view.title)
         if view.kind == "category" and view.category is not None:
             series = self._category_data_cache[view.category]
             bar_color = "#60A5FA" if view.category == BLOCK_CATEGORY_REST else "#F87171"
-            self._plot_series(plot_widget, series, view.title, bar_color, view.metrics)
+            self._plot_series(chart_view, series, view.title, bar_color, view.metrics)
         else:
             with session_scope() as session:
                 series = build_custom_metrics(session, days=self._current_days, block_ids=view.block_ids)
-            self._plot_series(plot_widget, series, view.title, "#3B82F6", view.metrics)
+            self._plot_series(chart_view, series, view.title, "#3B82F6", view.metrics)
         card.show()
 
         if self._render_queue:
@@ -499,19 +542,14 @@ class StatsPage(QWidget):
             series = build_custom_metrics(session, days=days, block_ids=selected_ids)
         metrics = self._current_metrics()
 
-        self.custom_plot.clear()
+        chart = self.custom_chart_view.chart()
+        chart.removeAllSeries()
+        for axis in chart.axes():
+            chart.removeAxis(axis)
         if not any(metrics.values()):
-            self.custom_plot.setXRange(0, 1, padding=0)
-            self.custom_plot.setYRange(0, 1, padding=0)
-            self.custom_plot.hideAxis("bottom")
-            self.custom_plot.hideAxis("left")
-            text_item = pg.TextItem(text="请至少选择一个指标", color="#64748B", anchor=(0.5, 0.5))
-            text_item.setPos(0.5, 0.5)
-            self.custom_plot.addItem(text_item)
+            chart.setTitle("请至少选择一个指标")
             return
-        self.custom_plot.showAxis("bottom")
-        self.custom_plot.showAxis("left")
-        self._plot_series(self.custom_plot, series, "自定义统计预览", "#3B82F6", metrics)
+        self._plot_series(self.custom_chart_view, series, "自定义统计预览", "#3B82F6", metrics)
 
     def save_custom_view(self) -> None:
         selected_ids = self._selected_block_ids()

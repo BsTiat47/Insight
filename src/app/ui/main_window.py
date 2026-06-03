@@ -23,6 +23,7 @@ from .blocks_page import BlocksPage
 from .points_page import PointsPage
 from .record_page import RecordPage
 from .settings_page import SettingsPage
+from .tasks_page import TasksPage
 
 
 class MainWindow(QMainWindow):
@@ -36,13 +37,14 @@ class MainWindow(QMainWindow):
         self.nav = QListWidget()
         self.nav.setFixedWidth(180)
         self.nav.setObjectName("sideNav")
-        for item in ["记录", "统计", "积分", "关联性分析", "方块管理", "设置"]:
+        for item in ["记录", "统计", "积分", "待办", "关联性分析", "方块管理", "设置"]:
             QListWidgetItem(item, self.nav)
 
         self.stack = QStackedWidget()
         self.record_page = RecordPage(on_data_changed=self.refresh_all, undo_stack=self._undo_stack)
         self.stats_page = None
         self.points_page = PointsPage(undo_stack=self._undo_stack)
+        self.tasks_page = TasksPage()
         self.correlation_page = None
         self._stats_placeholder = QLabel("统计页首次打开时加载...")
         self._stats_placeholder.setAlignment(Qt.AlignCenter)
@@ -51,12 +53,13 @@ class MainWindow(QMainWindow):
         self.blocks_page = BlocksPage(on_blocks_changed=self.refresh_all, undo_stack=self._undo_stack)
         self.settings_page = SettingsPage(db_path=db_path)
 
-        self.stack.addWidget(self.record_page)
-        self.stack.addWidget(self._stats_placeholder)
-        self.stack.addWidget(self.points_page)
-        self.stack.addWidget(self._corr_placeholder)
-        self.stack.addWidget(self.blocks_page)
-        self.stack.addWidget(self.settings_page)
+        self.stack.addWidget(self.record_page)        # 0
+        self.stack.addWidget(self._stats_placeholder)  # 1
+        self.stack.addWidget(self.points_page)         # 2
+        self.stack.addWidget(self.tasks_page)          # 3
+        self.stack.addWidget(self._corr_placeholder)   # 4
+        self.stack.addWidget(self.blocks_page)         # 5
+        self.stack.addWidget(self.settings_page)       # 6
 
         self.nav.currentRowChanged.connect(self.on_nav_changed)
         self.nav.setCurrentRow(0)
@@ -97,6 +100,7 @@ class MainWindow(QMainWindow):
         if self.stats_page is not None:
             self.stats_page.refresh()
         self.points_page.refresh()
+        self.tasks_page.refresh()
         if self.correlation_page is not None:
             self.correlation_page.refresh()
         self.blocks_page.refresh()
@@ -114,7 +118,7 @@ class MainWindow(QMainWindow):
     def on_nav_changed(self, index: int) -> None:
         if index == 1:
             self._ensure_stats_page()
-        elif index == 3:
+        elif index == 4:
             self._ensure_correlation_page()
         self.stack.setCurrentIndex(index)
 
@@ -126,4 +130,4 @@ class MainWindow(QMainWindow):
         self.correlation_page = CorrelationPage()
         self.stack.removeWidget(self._corr_placeholder)
         self._corr_placeholder.deleteLater()
-        self.stack.insertWidget(3, self.correlation_page)
+        self.stack.insertWidget(4, self.correlation_page)
