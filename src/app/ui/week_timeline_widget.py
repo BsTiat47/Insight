@@ -25,7 +25,7 @@ class WeekTimelineWidget(QWidget):
     recordSelectionChanged = Signal(list)  # list of selected record IDs
 
     SNAP_SAME_DAY_MINUTES = 20   # strong vertical snap within same day
-    SNAP_CROSS_DAY_MINUTES = 5   # weak horizontal alignment across days
+    SNAP_CROSS_DAY_MINUTES = 10  # weak horizontal alignment across days
 
     # High-contrast palette for per-event coloring within a day
     EVENT_PALETTE = [
@@ -61,13 +61,16 @@ class WeekTimelineWidget(QWidget):
         self._anchor: tuple[int, int] | None = None  # (day_idx, minute)
         self._cursor: tuple[int, int] | None = None
 
-        # Record selection & move-drag state
+        # Record selection & move/resize-drag state
         self._selected_ids: set[int] = set()
-        self._drag_mode: str = "none"  # 'none' | 'select' | 'move'
+        self._drag_mode: str = "none"  # 'none' | 'select' | 'move' | 'resize_top' | 'resize_bottom'
         self._drag_start_y: float = 0.0
         self._move_offset_minutes: int = 0
         self._snapped_offset_minutes: int = 0
         self._move_original: dict[int, tuple[datetime, datetime]] = {}
+        self._resize_record_id: int | None = None
+        self._resize_orig_start: datetime | None = None
+        self._resize_orig_end: datetime | None = None
 
         # AI suggestion preview
         self._ai_suggestion_events: list[dict] = []  # list of {block_name, start_dt, end_dt, note}
@@ -119,6 +122,9 @@ class WeekTimelineWidget(QWidget):
         self._move_offset_minutes = 0
         self._snapped_offset_minutes = 0
         self._move_original.clear()
+        self._resize_record_id = None
+        self._resize_orig_start = None
+        self._resize_orig_end = None
         self.update()
 
     def selected_range(self) -> tuple[datetime, datetime] | None:
@@ -306,31 +312,92 @@ class WeekTimelineWidget(QWidget):
         """Convert a datetime to minutes since midnight."""
         return dt.hour * 60 + dt.minute
 
+    def _record_edge_at_point(self, point: QPoint, record_id: int) -> str | None:
+        """Return 'top' if point is near the top edge of the record's rect, 'bottom' if near bottom, else None."""
+        grid = self._grid_rect()
+        day_width = self._day_col_width()
+        week_start_dt = datetime.combine(self._week_start, time.min)
+        week_end_dt = week_start_dt + timedelta(days=7)
+        EDGE_PX = 16  # pixels from edge to trigger resize
+
+        for rec in self._records:
+            if rec.id != record_id:
+                continue
+            start = max(rec.start_time, week_start_dt)
+            end = min(rec.end_time, week_end_dt)
+            if end <= start:
+                continue
+            day_cursor = start.date()
+            while day_cursor <= (end - timedelta(microseconds=1)).date():
+                day_start = datetime.combine(day_cursor, time.min)
+                day_end_dt = day_start + timedelta(days=1)
+                seg_start = max(start, day_start)
+                seg_end = min(end, day_end_dt)
+                if seg_end > seg_start:
+                    day_idx = (day_cursor - self._week_start).days
+                    if 0 <= day_idx < 7:
+                        start_min = int((seg_start - day_start).total_seconds() // 60)
+                        end_min = int((seg_end - day_start).total_seconds() // 60)
+                        x = grid.left() + day_idx * day_width + 2
+                        y1 = self._minute_to_y(start_min)
+                        y2 = self._minute_to_y(end_min)
+                        rect = QRectF(x, y1, max(6.0, day_width - 4), max(2.0, y2 - y1))
+                        if rect.contains(point):
+                            if abs(point.y() - y1) <= EDGE_PX:
+                                return "top"
+                            if abs(point.y() - y2) <= EDGE_PX:
+                                return "bottom"
+                            return "middle"
+                day_cursor += timedelta(days=1)
+        return None
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             point = event.position().toPoint()
             hit_ids = self._records_at_point(point)
             if hit_ids:
-                # Click on record(s): select and prepare for move-drag
                 ctrl_held = event.modifiers() & Qt.KeyboardModifier.ControlModifier
-                if ctrl_held:
+                if not ctrl_held:
+                    self._selected_ids = set(hit_ids)
+                else:
                     for rid in hit_ids:
                         if rid in self._selected_ids:
                             self._selected_ids.discard(rid)
                         else:
                             self._selected_ids.add(rid)
+
+                # Check for edge resize on first hit record
+                edge = self._record_edge_at_point(point, hit_ids[0]) if len(hit_ids) == 1 and not ctrl_held else None
+                if edge == "top":
+                    self._drag_mode = "resize_top"
+                    self.setCursor(Qt.CursorShape.SizeVerCursor)
+                    self._resize_record_id = hit_ids[0]
+                    for rec in self._records:
+                        if rec.id == hit_ids[0]:
+                            self._resize_orig_start = rec.start_time
+                            self._resize_orig_end = rec.end_time
+                            break
+                elif edge == "bottom":
+                    self._drag_mode = "resize_bottom"
+                    self.setCursor(Qt.CursorShape.SizeVerCursor)
+                    self._resize_record_id = hit_ids[0]
+                    for rec in self._records:
+                        if rec.id == hit_ids[0]:
+                            self._resize_orig_start = rec.start_time
+                            self._resize_orig_end = rec.end_time
+                            break
                 else:
-                    self._selected_ids = set(hit_ids)
-                self._drag_mode = "move"
+                    self._drag_mode = "move"
+                    self._move_original = {}
+                    for rid in self._selected_ids:
+                        for rec in self._records:
+                            if rec.id == rid:
+                                self._move_original[rid] = (rec.start_time, rec.end_time)
+                                break
+
                 self._drag_start_y = float(point.y())
                 self._move_offset_minutes = 0
                 self._snapped_offset_minutes = 0
-                self._move_original = {}
-                for rid in self._selected_ids:
-                    for rec in self._records:
-                        if rec.id == rid:
-                            self._move_original[rid] = (rec.start_time, rec.end_time)
-                            break
                 self._dragging = False
                 self._anchor = None
                 self._cursor = None
@@ -353,7 +420,33 @@ class WeekTimelineWidget(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_mode == "move" and self._move_original:
+        if self._drag_mode in ("resize_top", "resize_bottom") and self._resize_record_id is not None:
+            current_y = float(event.position().toPoint().y())
+            current_min = self._y_to_minute(current_y)
+            # Snap to 30-min boundaries for resize
+            snapped_min = int(round(current_min / self._selection_slot_minutes) * self._selection_slot_minutes)
+            snapped_min = max(0, min(24 * 60, snapped_min))
+
+            # Update the record in-place for visual preview
+            for rec in self._records:
+                if rec.id == self._resize_record_id:
+                    if self._drag_mode == "resize_top":
+                        new_start = snapped_min
+                        # Keep within bounds and ensure positive duration
+                        end_min = self._datetime_to_minute_in_day(self._resize_orig_end)
+                        if new_start < end_min - self._selection_slot_minutes:
+                            rec.start_time = rec.start_time.replace(
+                                hour=new_start // 60, minute=new_start % 60, second=0, microsecond=0)
+                    else:  # resize_bottom
+                        new_end = snapped_min
+                        start_min = self._datetime_to_minute_in_day(self._resize_orig_start)
+                        if new_end > start_min + self._selection_slot_minutes:
+                            rec.end_time = rec.end_time.replace(
+                                hour=new_end // 60, minute=new_end % 60, second=0, microsecond=0)
+                    break
+            self.update()
+
+        elif self._drag_mode == "move" and self._move_original:
             current_y = float(event.position().toPoint().y())
             delta_y = current_y - self._drag_start_y
             start_min = self._y_to_minute(self._drag_start_y)
@@ -379,11 +472,42 @@ class WeekTimelineWidget(QWidget):
             if pos is not None:
                 self._cursor = pos
                 self.update()
+        elif self._drag_mode == "none":
+            # Idle hover: show resize cursor when near edge of selected record
+            point = event.position().toPoint()
+            edge = None
+            for rid in self._selected_ids:
+                edge = self._record_edge_at_point(point, rid)
+                if edge in ("top", "bottom"):
+                    break
+            if edge in ("top", "bottom"):
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._drag_mode == "move":
+            if self._drag_mode in ("resize_top", "resize_bottom"):
+                if self._resize_record_id is not None:
+                    for rec in self._records:
+                        if rec.id == self._resize_record_id:
+                            # Only emit if actually changed
+                            if (rec.start_time != self._resize_orig_start or
+                                    rec.end_time != self._resize_orig_end):
+                                self.recordMoved.emit([(rec.id, rec.start_time, rec.end_time)])
+                            else:
+                                # Restore originals (no-op drag)
+                                rec.start_time = self._resize_orig_start
+                                rec.end_time = self._resize_orig_end
+                            break
+                self._drag_mode = "none"
+                self._resize_record_id = None
+                self._resize_orig_start = None
+                self._resize_orig_end = None
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self.update()
+            elif self._drag_mode == "move":
                 offset = self._snapped_offset_minutes or self._move_offset_minutes
                 if offset != 0 and self._move_original:
                     moves: list[tuple[int, datetime, datetime]] = []
@@ -508,6 +632,12 @@ class WeekTimelineWidget(QWidget):
                             sel_pen.setWidth(2)
                             painter.setPen(sel_pen)
                             painter.drawRect(rect)
+                            # Resize handles: small bars at top & bottom
+                            handle_w = min(20.0, rect.width() * 0.4)
+                            handle_x = rect.left() + (rect.width() - handle_w) / 2
+                            handle_h = 3.0
+                            painter.fillRect(QRectF(handle_x, rect.top() - 1, handle_w, handle_h), QColor("#2563EB"))
+                            painter.fillRect(QRectF(handle_x, rect.bottom() - 2, handle_w, handle_h), QColor("#2563EB"))
                             painter.setPen(Qt.PenStyle.NoPen)
                         name = self._block_names.get(rec.block_id, f"#{rec.block_id}")
                         label_candidates.append((day_idx, rect, name, QColor("#ffffff")))
