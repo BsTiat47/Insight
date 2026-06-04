@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
-from ..domain.models import ActivityRecord, AppSetting, CorrelationProject, EventBlock, PointAccount, PointLedgerEntry
+from ..domain.models import ActivityRecord, AppSetting, CorrelationProject, EventBlock, PointAccount, PointLedgerEntry, Task
 from .database import now_utc
 
 BLOCK_CATEGORY_REST = "rest_entertainment"
@@ -374,6 +374,60 @@ def save_points_settings(
     return get_points_settings(session)
 
 
+# ── AI settings ──────────────────────────────────────────────
+
+@dataclass
+class AISettings:
+    enabled: bool = False
+    api_url: str = "https://api.deepseek.com/v1/chat/completions"
+    api_key: str = ""
+    model: str = "deepseek-chat"
+    system_prompt: str = ""
+
+
+DEFAULT_AI_SYSTEM_PROMPT = (
+    "你是一个个人日程助理。用户框选了一个时间段，你需要为其安排合理的活动。\n"
+    "规则：\n"
+    "1. 根据用户习惯和待办事项，将时间段拆分为连续的活动块。\n"
+    "2. 连续无间隙：events的start_offset_minutes和end_offset_minutes必须首尾相连，覆盖整个时间段。\n"
+    "3. 第一个event的start_offset_minutes必须为0，最后一个的end_offset_minutes必须等于总时长。\n\n"
+    "示例（3小时的时间段）：\n"
+    '{"events": [\n'
+    '  {"block_name": "学习", "start_offset_minutes": 0, "end_offset_minutes": 90, "efficiency_score": 4, "state_score": 3, "mood_score": null, "note": "集中学习"},\n'
+    '  {"block_name": "休息", "start_offset_minutes": 90, "end_offset_minutes": 105, "efficiency_score": null, "state_score": null, "mood_score": null, "note": "短暂休息"},\n'
+    '  {"block_name": "学习", "start_offset_minutes": 105, "end_offset_minutes": 180, "efficiency_score": 3, "state_score": 3, "mood_score": null, "note": "继续学习"}\n'
+    "]}\n"
+    "只返回JSON，不要有其他内容。"
+)
+
+
+def get_ai_settings(session: Session) -> AISettings:
+    return AISettings(
+        enabled=_setting_get(session, "ai_enabled", "0") == "1",
+        api_url=_setting_get(session, "ai_api_url", "https://api.deepseek.com/v1/chat/completions"),
+        api_key=_setting_get(session, "ai_api_key", ""),
+        model=_setting_get(session, "ai_model", "deepseek-chat"),
+        system_prompt=_setting_get(session, "ai_system_prompt", DEFAULT_AI_SYSTEM_PROMPT),
+    )
+
+
+def save_ai_settings(
+    session: Session,
+    *,
+    enabled: bool,
+    api_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+) -> AISettings:
+    _setting_set(session, "ai_enabled", "1" if enabled else "0")
+    _setting_set(session, "ai_api_url", api_url)
+    _setting_set(session, "ai_api_key", api_key)
+    _setting_set(session, "ai_model", model)
+    _setting_set(session, "ai_system_prompt", system_prompt)
+    return get_ai_settings(session)
+
+
 def get_point_account(session: Session) -> PointAccount:
     account = session.get(PointAccount, 1)
     if account is None:
@@ -422,4 +476,80 @@ def sum_point_ledger_by_ref(session: Session, *, ref_type: str, ref_id: int) -> 
 
 def list_point_ledger(session: Session, limit: int = 200) -> list[PointLedgerEntry]:
     stmt = select(PointLedgerEntry).order_by(PointLedgerEntry.created_at.desc(), PointLedgerEntry.id.desc()).limit(limit)
+    return list(session.scalars(stmt).all())
+
+
+# ── Task CRUD ──────────────────────────────────────────────
+
+def create_task(
+    session: Session,
+    *,
+    name: str,
+    task_type: str,
+    end_date: date,
+    start_date: date | None = None,
+    total_minutes: int | None = None,
+    daily_minutes: int | None = None,
+) -> Task:
+    task = Task(
+        name=name,
+        task_type=task_type,
+        start_date=start_date,
+        end_date=end_date,
+        total_minutes=total_minutes,
+        daily_minutes=daily_minutes,
+    )
+    session.add(task)
+    session.flush()
+    return task
+
+
+def update_task(
+    session: Session,
+    task_id: int,
+    *,
+    name: str,
+    task_type: str,
+    end_date: date,
+    start_date: date | None = None,
+    total_minutes: int | None = None,
+    daily_minutes: int | None = None,
+    is_completed: bool = False,
+) -> Task:
+    task = session.get(Task, task_id)
+    if task is None:
+        raise ValueError(f"Task {task_id} not found")
+    task.name = name
+    task.task_type = task_type
+    task.start_date = start_date
+    task.end_date = end_date
+    task.total_minutes = total_minutes
+    task.daily_minutes = daily_minutes
+    task.is_completed = is_completed
+    task.updated_at = now_utc()
+    session.flush()
+    return task
+
+
+def delete_task(session: Session, task_id: int) -> None:
+    task = session.get(Task, task_id)
+    if task is not None:
+        session.delete(task)
+        session.flush()
+
+
+def complete_task(session: Session, task_id: int) -> Task:
+    task = session.get(Task, task_id)
+    if task is None:
+        raise ValueError(f"Task {task_id} not found")
+    task.is_completed = True
+    task.updated_at = now_utc()
+    session.flush()
+    return task
+
+
+def list_tasks(session: Session, *, include_completed: bool = False) -> list[Task]:
+    stmt = select(Task).order_by(Task.is_completed.asc(), Task.end_date.asc(), Task.id.asc())
+    if not include_completed:
+        stmt = stmt.where(Task.is_completed == False)  # noqa: E712
     return list(session.scalars(stmt).all())

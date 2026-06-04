@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QTime
+from PySide6.QtCore import QTime, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTimeEdit,
     QVBoxLayout,
@@ -20,7 +23,15 @@ from PySide6.QtWidgets import (
 )
 
 from ..storage.database import session_scope
-from ..storage.repositories import get_points_settings, list_blocks, save_points_settings, update_block
+from ..storage.repositories import (
+    DEFAULT_AI_SYSTEM_PROMPT,
+    get_ai_settings,
+    get_points_settings,
+    list_blocks,
+    save_ai_settings,
+    save_points_settings,
+    update_block,
+)
 
 
 class SettingsPage(QWidget):
@@ -31,6 +42,7 @@ class SettingsPage(QWidget):
             "评分说明：效率/状态/心情 1-5（可选）。\n"
             "积分说明：按事件时长 * 每分钟积分计算；可在此开关与配置睡眠奖励。"
         )
+        # ── Points settings ──
         self.points_enabled_checkbox = QCheckBox("启用自动积分计算")
         self.block_combo = QComboBox()
         self.block_points_spin = QDoubleSpinBox()
@@ -50,7 +62,42 @@ class SettingsPage(QWidget):
         self.save_btn = QPushButton("保存积分设置")
         self.save_btn.clicked.connect(self.save_points_config)
 
-        layout = QVBoxLayout(self)
+        # ── AI settings ──
+        self.ai_enabled_checkbox = QCheckBox("启用AI自动补全（框选时间段时自动建议日程）")
+        self.ai_api_url = QLineEdit()
+        self.ai_api_url.setPlaceholderText("https://api.deepseek.com/v1/chat/completions")
+        self.ai_api_key = QLineEdit()
+        self.ai_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ai_api_key.setPlaceholderText("sk-...")
+        self.ai_model = QLineEdit()
+        self.ai_model.setPlaceholderText("deepseek-chat")
+        self.ai_system_prompt = QLineEdit()
+        self.ai_system_prompt.setPlaceholderText("默认系统提示词（可自定义）")
+        self.ai_test_btn = QPushButton("测试连接")
+        self.ai_test_btn.clicked.connect(self._test_ai_connection)
+        self.ai_save_btn = QPushButton("保存AI设置")
+        self.ai_save_btn.clicked.connect(self._save_ai_config)
+
+        ai_group = QGroupBox("AI 自动补全设置（默认 DeepSeek API）")
+        ai_layout = QVBoxLayout(ai_group)
+        ai_layout.addWidget(self.ai_enabled_checkbox)
+        ai_layout.addWidget(QLabel("API 地址"))
+        ai_layout.addWidget(self.ai_api_url)
+        ai_layout.addWidget(QLabel("API Key"))
+        ai_layout.addWidget(self.ai_api_key)
+        ai_layout.addWidget(QLabel("模型名称"))
+        ai_layout.addWidget(self.ai_model)
+        ai_layout.addWidget(QLabel("自定义系统提示词"))
+        ai_layout.addWidget(self.ai_system_prompt)
+        ai_btn_row = QHBoxLayout()
+        ai_btn_row.addWidget(self.ai_test_btn)
+        ai_btn_row.addWidget(self.ai_save_btn)
+        ai_btn_row.addStretch()
+        ai_layout.addLayout(ai_btn_row)
+
+        # ── Layout ──
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
         layout.addWidget(self.db_label)
@@ -78,10 +125,20 @@ class SettingsPage(QWidget):
         row2.addStretch()
         layout.addLayout(row2)
         layout.addWidget(self.save_btn)
+        layout.addWidget(ai_group)
         layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(scroll)
+
         self._block_items: list[tuple[int, str, str]] = []
         self._reload_block_rules()
         self._load_points_config()
+        self._load_ai_config()
 
     def _load_points_config(self) -> None:
         with session_scope() as session:
@@ -157,3 +214,46 @@ class SettingsPage(QWidget):
             )
         self._reload_block_rules()
         QMessageBox.information(self, "提示", "方块积分规则已保存。")
+
+    # ── AI settings ──
+
+    def _load_ai_config(self) -> None:
+        with session_scope() as session:
+            settings = get_ai_settings(session)
+        self.ai_enabled_checkbox.setChecked(settings.enabled)
+        self.ai_api_url.setText(settings.api_url)
+        self.ai_api_key.setText(settings.api_key)
+        self.ai_model.setText(settings.model)
+        self.ai_system_prompt.setText(settings.system_prompt)
+
+    def _save_ai_config(self) -> None:
+        with session_scope() as session:
+            save_ai_settings(
+                session,
+                enabled=self.ai_enabled_checkbox.isChecked(),
+                api_url=self.ai_api_url.text().strip(),
+                api_key=self.ai_api_key.text().strip(),
+                model=self.ai_model.text().strip(),
+                system_prompt=self.ai_system_prompt.text().strip() or DEFAULT_AI_SYSTEM_PROMPT,
+            )
+        QMessageBox.information(self, "提示", "AI 设置已保存。")
+
+    def _test_ai_connection(self) -> None:
+        from ..services.ai_service import test_connection
+        from ..storage.repositories import AISettings
+
+        settings = AISettings(
+            enabled=True,
+            api_url=self.ai_api_url.text().strip(),
+            api_key=self.ai_api_key.text().strip(),
+            model=self.ai_model.text().strip(),
+        )
+        self.ai_test_btn.setEnabled(False)
+        self.ai_test_btn.setText("测试中...")
+        result = test_connection(settings)
+        self.ai_test_btn.setEnabled(True)
+        self.ai_test_btn.setText("测试连接")
+        if result == "ok":
+            QMessageBox.information(self, "AI 连接测试", "连接成功！API 响应正常。")
+        else:
+            QMessageBox.warning(self, "AI 连接测试", f"连接失败：{result}")
