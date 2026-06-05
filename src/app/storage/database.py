@@ -35,6 +35,7 @@ def init_db(db_path: Path) -> None:
         EventBlock,
         PointAccount,
         PointLedgerEntry,
+        Task,
     )
 
     Base.metadata.create_all(engine)
@@ -81,6 +82,11 @@ def init_db(db_path: Path) -> None:
             conn.execute(text("DROP TABLE activity_records"))
             conn.execute(text("ALTER TABLE activity_records_new RENAME TO activity_records"))
             conn.execute(text("PRAGMA foreign_keys=ON"))
+
+        task_cols = conn.execute(text("PRAGMA table_info(tasks)")).fetchall()
+        task_col_names = {row[1] for row in task_cols}
+        if "block_id" not in task_col_names:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN block_id INTEGER REFERENCES event_blocks(id)"))
 
         cols = conn.execute(text("PRAGMA table_info(event_blocks)")).fetchall()
         col_names = {row[1] for row in cols}
